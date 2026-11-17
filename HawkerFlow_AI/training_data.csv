@@ -1,0 +1,13 @@
+pm25,air_velocity,fan_speed,route,condition
+10,1.8,40,A,Normal
+15,1.7,40,A,Normal
+12,1.9,40,B,Normal
+18,2.0,50,B,Normal
+80,1.8,40,A,Cooking
+100,1.7,40,A,Cooking
+120,1.9,40,B,Cooking
+95,2.0,50,B,Cooking
+15,0.5,40,A,Blocked
+20,0.6,40,A,Blocked
+18,0.4,40,B,Blocked
+25,0.7,50,B,Blocked
