@@ -52,3 +52,4 @@ def run_hawkerflow(pm25, air_velocity, fan_speed, route):
 # Simulate 3 test scenarios
 run_hawkerflow(30, 1.8, 40, "A")
 
+

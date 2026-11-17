@@ -34,3 +34,6 @@ except KeyboardInterrupt:
 finally:
     if "esp32" in locals() and esp32.is_open:
         esp32.close()
+
+
+

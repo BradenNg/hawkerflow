@@ -94,3 +94,5 @@ test_messages = [
 
 for message in test_messages:
     process_sensor_data(message)
+
+#asdasd
