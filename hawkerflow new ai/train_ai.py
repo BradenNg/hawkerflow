@@ -1,92 +1,58 @@
+
 import pandas as pd
 import joblib
 
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix
+)
 
-# STEP 1: Load simulated data
+# Load simulated pressure dataset
 data = pd.read_csv("simulated_data.csv")
 
-print("Total simulated readings:", len(data))
-
-# STEP 2: Prepare AI inputs
+# AI inputs: pressure difference, fan speed, route
 X = pd.get_dummies(
-    data[["temperature", "pressure", "fan_speed", "route"]]
+    data[["delta_pressure", "fan_speed", "route"]]
 )
 
-# STEP 3: Prepare correct answers
-y_cooking = data["cooking"]
-y_blocked = data["blocked"]
+# AI target: blocked or not blocked
+y = data["blocked"]
 
-# STEP 4: Split data into training and testing sets
-(
-    X_train,
-    X_test,
-    cooking_train,
-    cooking_test,
-    blocked_train,
-    blocked_test
-) = train_test_split(
-    X,
-    y_cooking,
-    y_blocked,
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
     test_size=0.2,
     random_state=42,
-    stratify=(
-        y_cooking.astype(str) +
-        y_blocked.astype(str)
-    )
+    stratify=y
 )
 
-# STEP 5: Create AI models
-cooking_ai = DecisionTreeClassifier(
+# Train blockage AI
+model = DecisionTreeClassifier(
     max_depth=5,
+    min_samples_leaf=10,
     random_state=42
 )
 
-blockage_ai = DecisionTreeClassifier(
-    max_depth=5,
-    random_state=42
-)
+model.fit(X_train, y_train)
 
-# STEP 6: Train both AI models
-cooking_ai.fit(X_train, cooking_train)
-blockage_ai.fit(X_train, blocked_train)
+# Test
+predictions = model.predict(X_test)
 
-print("\nBoth AI models trained successfully!")
-
-# STEP 7: Evaluate cooking detection
-cooking_predictions = cooking_ai.predict(X_test)
-
-print("\n--- COOKING DETECTION ---")
-print("Accuracy:", accuracy_score(
-    cooking_test, cooking_predictions
-))
+print("\nFILTER BLOCKAGE AI RESULTS")
+print("Accuracy:", accuracy_score(y_test, predictions))
 print(classification_report(
-    cooking_test,
-    cooking_predictions,
-    zero_division=0
+    y_test, predictions, zero_division=0
 ))
+print("Confusion matrix:")
+print(confusion_matrix(y_test, predictions))
 
-# STEP 8: Evaluate filter blockage detection
-blockage_predictions = blockage_ai.predict(X_test)
-
-print("\n--- FILTER BLOCKAGE DETECTION ---")
-print("Accuracy:", accuracy_score(
-    blocked_test, blockage_predictions
-))
-print(classification_report(
-    blocked_test,
-    blockage_predictions,
-    zero_division=0
-))
-
-# STEP 9: Save the trained models
+# Save model
 joblib.dump({
-    "cooking_model": cooking_ai,
-    "blocked_model": blockage_ai,
+    "model": model,
     "columns": X.columns.tolist()
 }, "hawkerflow_ai.joblib")
 
-print("\nAI models saved successfully!")
+print("\nAI model saved successfully!")
+print("WARNING: Results are based on synthetic data only.")

@@ -1,66 +1,53 @@
 import numpy as np
 import pandas as pd
 
-# Make random results reproducible
 rng = np.random.default_rng(42)
-
 rows = []
 
-# Generate 3000 simulated readings
-for _ in range(3000):
+# Synthetic clean-filter pressure differences.
+# These are NOT actual HX710B values.
+BASELINES = {
+    (35, "A"): 2.0,
+    (35, "B"): 2.2,
+    (100, "A"): 6.0,
+    (100, "B"): 6.5
+}
 
-    # Simulate whether cooking is happening
-    cooking = int(rng.random() < 0.5)
+for i in range(3000):
 
-    # Simulate whether filter is blocked
-    blocked = int(rng.random() < 0.3)
-
-    # Fan speed and filter route
-    fan = int(rng.choice([40, 60, 80]))
+    fan = int(rng.choice([35, 100]))
     route = str(rng.choice(["A", "B"]))
 
-    # DHT22 temperature simulation
-    ambient = rng.uniform(27, 36)
+    blocked = int(rng.random() < 0.35)
 
-    if cooking:
-        temperature = ambient + rng.uniform(1, 12)
-    else:
-        temperature = ambient + rng.uniform(-1, 3)
+    baseline = BASELINES[(fan, route)]
 
-    temperature += rng.normal(0, 0.5)
-
-    # HX710B pressure simulation
-    # Arbitrary relative pressure units.
-    # NOT real Pa or calibrated HX710B readings.
-
-    baseline = (
-        1000 if route == "A" else 950
-    ) * (fan / 40)
-
-    # Fictional assumption:
-    # blockage tends to increase this reading.
+    # Simulated pressure difference increases
+    # with restriction, with overlapping noise.
     if blocked:
-        pressure = baseline * rng.uniform(1.15, 1.75)
+        delta = baseline * rng.uniform(1.3, 2.4)
     else:
-        pressure = baseline * rng.uniform(0.85, 1.25)
+        delta = baseline * rng.uniform(0.7, 1.4)
 
-    pressure += rng.normal(0, 60)
+    delta += rng.normal(0, 0.25)
 
-    # Save one reading
+    # Simulated pressure readings on active route
+    after = 13.0 + rng.normal(0, 0.3)
+    before = after + delta
+
     rows.append({
-        "temperature": round(temperature, 2),
-        "pressure": round(pressure, 2),
+        "test_id": i,
         "fan_speed": fan,
         "route": route,
-        "cooking": cooking,
+        "pressure_before": round(before, 3),
+        "pressure_after": round(after, 3),
+        "delta_pressure": round(before - after, 3),
         "blocked": blocked
     })
 
-# Convert into a table
 df = pd.DataFrame(rows)
 
-# Save data into CSV file
 df.to_csv("simulated_data.csv", index=False)
 
-print("Successfully generated 3000 readings!")
+print("Generated 3000 simulated readings!")
 print(df.head())

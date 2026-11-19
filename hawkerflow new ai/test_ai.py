@@ -1,21 +1,27 @@
+
 import pandas as pd
 import joblib
 import math
 
-# Load the trained AI models
 saved = joblib.load("hawkerflow_ai.joblib")
 
-cooking_model = saved["cooking_model"]
-blocked_model = saved["blocked_model"]
+model = saved["model"]
 columns = saved["columns"]
 
 
-def test_hawkerflow(temperature, pressure, fan, route):
+def get_fan_speed(temperature):
+    if temperature < 33:
+        return 0
+    elif temperature <= 39:
+        return 35
+    else:
+        return 100
 
-    # Prepare inputs for AI
+
+def predict_blockage(delta, fan, route):
+
     data = pd.DataFrame([{
-        "temperature": temperature,
-        "pressure": pressure,
+        "delta_pressure": delta,
         "fan_speed": fan,
         "route": route
     }])
@@ -23,69 +29,87 @@ def test_hawkerflow(temperature, pressure, fan, route):
     X = pd.get_dummies(data)
     X = X.reindex(columns=columns, fill_value=0)
 
-    # AI predictions
-    cooking = bool(cooking_model.predict(X)[0])
-    blocked = bool(blocked_model.predict(X)[0])
+    return bool(model.predict(X)[0])
 
-    # Simulated control logic
-    new_fan = 80 if cooking else 40
-    new_route = route
 
-    if blocked:
-        new_route = "B" if route == "A" else "A"
+def test_hawkerflow(temp, p1, p2, p3, p4, route):
+
+    fan = get_fan_speed(temp)
+
+    # Pressure difference for both routes
+    delta_a = p1 - p2
+    delta_b = p3 - p4
 
     print("\n----------------------------")
-    print("Temperature:", temperature, "C")
-    print("Pressure:", pressure, "(simulated units)")
-    print("Current Fan Speed:", fan, "%")
-    print("Current Filter Route:", route)
+    print("Temperature:", temp, "C")
+    print("Fan speed:", fan, "%")
+    print("Active route:", route)
 
-    print("\nAI PREDICTIONS:")
-    print("Cooking Detected:", cooking)
-    print("Filter Blocked:", blocked)
+    print("\nPRESSURE READINGS:")
+    print("Route A difference:", round(delta_a, 3))
+    print("Route B difference:", round(delta_b, 3))
 
-    print("\nSIMULATED ACTIONS:")
-    print("New Fan Speed:", new_fan, "%")
-    print("Proposed Filter Route:", new_route)
+    if fan == 0:
+        print("\nFan OFF")
+        print("Blockage check skipped.")
+        print("No route switching required.")
+        return
+
+    # Only classify the active route
+    delta = delta_a if route == "A" else delta_b
+
+    blocked = predict_blockage(delta, fan, route)
+
+    print("\nAI PREDICTION:")
+    print("Active filter blocked:", blocked)
 
     if blocked:
-        print("ALERT: Possible filter blockage!")
+        proposed_route = "B" if route == "A" else "A"
+
+        print("\nPOSSIBLE BLOCKAGE!")
+        print("Proposed route:", proposed_route)
+        print("ALERT: Inspect Filter", route)
+        print("Confirm alternate route is clear")
+        print("before commanding servo.")
+    else:
+        print("\nFilter appears normal.")
+        print("Keep route:", route)
 
 
-print("HAWKERFLOW AI V3 TESTING")
-print("Simulation only. Pressure is not calibrated.")
+print("HAWKERFLOW FINAL AI TESTING")
+print("Synthetic pressure simulation only.")
 
 while True:
     try:
-        temperature = float(input("\nTemperature (C): "))
-        pressure = float(input("Pressure (simulated units): "))
-        fan = int(input("Fan Speed (40, 60, 80): "))
-        route = input("Filter Route (A/B): ").strip().upper()
+        temp = float(input("\nTemperature (C): "))
 
-        if not math.isfinite(temperature) or not math.isfinite(pressure):
-            print("Please enter finite sensor values.")
+        p1 = float(input("Pressure P1 (Before A): "))
+        p2 = float(input("Pressure P2 (After A): "))
+        p3 = float(input("Pressure P3 (Before B): "))
+        p4 = float(input("Pressure P4 (After B): "))
+
+        route = input("Active route (A/B): ").strip().upper()
+
+        values = [temp, p1, p2, p3, p4]
+
+        if not all(math.isfinite(x) for x in values):
+            print("Invalid sensor readings.")
             continue
 
-        if not (-40 <= temperature <= 80):
+        if not (-40 <= temp <= 80):
             print("Temperature outside DHT22 range.")
             continue
 
-        if fan not in [40, 60, 80]:
-            print("Choose fan speed 40, 60 or 80.")
-            continue
-
         if route not in ["A", "B"]:
-            print("Choose A or B.")
+            print("Choose route A or B.")
             continue
 
-        test_hawkerflow(
-            temperature, pressure, fan, route
-        )
+        test_hawkerflow(temp, p1, p2, p3, p4, route)
 
     except ValueError:
-        print("Invalid input. Please enter valid numbers.")
+        print("Please enter valid numbers.")
+        continue
 
-    again = input("\nTest another scenario? (y/n): ")
-    if again.lower().strip() != "y":
-        print("HawkerFlow AI testing stopped.")
+    again = input("\nTest again? (y/n): ")
+    if again.strip().lower() != "y":
         break
