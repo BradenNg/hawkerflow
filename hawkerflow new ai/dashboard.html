@@ -83,8 +83,21 @@
   button:hover { border-color: var(--muted); }
   button:disabled { opacity: .45; cursor: default; }
   .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
-  .demo-only { display: none; }
-  body.demo .demo-only { display: inline-block; }
+  .sim-only { display: none; }
+  body.sim .sim-only { display: block; }
+  .simpanel { border: 2px dashed var(--b); }
+  .simpanel h2 { color: var(--b); }
+  .simgrid { display: grid; grid-template-columns: 1.1fr 1.6fr 1fr 1fr; gap: 18px; }
+  @media (max-width: 900px) { .simgrid { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 480px) { .simgrid { grid-template-columns: 1fr; } }
+  .simgrid h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 600; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; background: transparent; }
+  .seg button.on { background: var(--b); color: #fff; }
+  .seg button.on.good { background: var(--normal); }
+  .seg button.on.bad { background: var(--blocked); }
+  input[type=range] { width: 100%; accent-color: var(--b); }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
 
   svg.duct { width: 100%; height: auto; display: block; }
   svg.duct text { font: 600 12px system-ui, sans-serif; fill: var(--ink); }
@@ -99,7 +112,7 @@
   .log li:last-child { border-bottom: 0; }
   .log time { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .log .warn { color: var(--blocked); font-weight: 600; }
-  .log .demo { color: var(--b); }
+  .log .sim { color: var(--b); }
   .log .esp { color: var(--muted); }
   table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
   td { padding: 4px 6px; border-bottom: 1px solid var(--line); }
@@ -111,12 +124,44 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>HawkerFlow Monitor</h1>
+    <h1 id="title">HawkerFlow Monitor</h1>
     <span id="conn" class="pill"><span class="dot"></span><span>Starting…</span></span>
     <span id="model" class="pill"></span>
     <span class="spacer"></span>
     <span id="clock" class="muted small"></span>
   </header>
+
+  <section class="card simpanel sim-only">
+    <h2>Simulation controls — nothing here is real hardware</h2>
+    <div class="simgrid">
+      <div>
+        <h4>ESP32-S3</h4>
+        <div class="seg"><button id="pw-on" onclick="sim('power/on')">On</button><button id="pw-off" onclick="sim('power/off')">Off</button></div>
+        <div class="row">
+          <button id="rst" onclick="sim('rst/x')">Press RST</button>
+          <button id="mute" onclick="sim('mute/' + (lastSim && lastSim.muted ? 'off' : 'on'))">Stop sending</button>
+        </div>
+      </div>
+      <div>
+        <h4>Kitchen temperature</h4>
+        <div class="seg"><button id="t-auto" onclick="sim('temp/auto')">Auto cooking cycle</button><button id="t-man" onclick="sim('temp/' + $('t-slider').value)">Set by hand</button></div>
+        <div class="row" style="flex-wrap:nowrap">
+          <input type="range" id="t-slider" min="20" max="50" step="0.5" value="36">
+          <strong id="t-val" style="min-width:56px;text-align:right">36.0 °C</strong>
+        </div>
+        <div class="small muted" id="t-step">—</div>
+      </div>
+      <div>
+        <h4>Filter A</h4>
+        <div class="seg"><button id="cA-clean" onclick="setClog('A', false)">Clean</button><button id="cA-clog" onclick="setClog('A', true)">Clogged</button></div>
+      </div>
+      <div>
+        <h4>Filter B</h4>
+        <div class="seg"><button id="cB-clean" onclick="setClog('B', false)">Clean</button><button id="cB-clog" onclick="setClog('B', true)">Clogged</button></div>
+      </div>
+    </div>
+    <p class="small muted" style="margin:12px 0 0">The AI only checks the filters while the fan is steady. With the current model a clog is only caught at 100% fan (above 39 °C).</p>
+  </section>
 
   <section>
     <div id="banner" class="banner">
@@ -264,7 +309,6 @@ function ventCard(v, s, d) {
     label = wait > 0 ? `Closed ${fmt(s.closed_for, 0)} s — can reopen in ${fmt(wait, 0)} s`
                      : `Below-limit readings in a row: ${s.under_streak}/${st.reopen} (reopens at ${st.reopen})`;
   }
-  const demo = d.demo_clogged ? `<button class="demo-only" onclick="post('/api/demo/clog/${v}')">${d.demo_clogged[v] ? "Simulate clean filter" : "Simulate clog"}</button>` : "";
   return `
     <div class="vent-head"><h3>Vent ${v}</h3>${pill}</div>
     <div class="small muted">Pressure drop across filter ${v}</div>
@@ -276,7 +320,7 @@ function ventCard(v, s, d) {
     <div class="small muted" style="margin-top:4px">${label}</div>
     <div class="report">${s.report || "No check yet"}</div>
     <div class="btns">
-      <button onclick="post('/api/vent/${v}/open')" ${s.closed ? "" : "disabled"}>Force vent ${v} open</button>${demo}
+      <button onclick="post('/api/vent/${v}/open')" ${s.closed ? "" : "disabled"}>Force vent ${v} open</button>
     </div>`;
 }
 
@@ -346,16 +390,23 @@ function offlineCard(v) {
 let last = null;
 function render(d) {
   last = d;
-  document.body.classList.toggle("demo", d.mode === "demo");
+  const isSim = d.mode === "sim";
+  document.body.classList.toggle("sim", isSim);
+  $("title").textContent = isSim ? "HawkerFlow Simulation" : "HawkerFlow Monitor";
+  document.title = isSim ? "HawkerFlow Simulation" : "HawkerFlow Monitor";
   // Online = port open AND a DATA line in the last 6 s (the ESP32 sends one every 2 s)
   const online = d.connected && d.data_age !== null && d.data_age <= 6;
   document.body.classList.toggle("offline", !online && d.mode !== null);
   document.body.classList.toggle("stale", !online && d.mode !== null);
   const conn = $("conn");
   conn.className = "pill " + (online ? "ok" : "bad");
-  conn.lastElementChild.textContent = d.mode === "demo" ? (online ? "Demo — simulated ESP32" : "Demo — starting…")
+  conn.lastElementChild.textContent = isSim ? (online ? "Simulated ESP32 online" : "Simulated ESP32 offline")
     : online ? `ESP32 online · ${d.port}` : d.connected ? `ESP32 not sending · ${d.port}` : `ESP32 offline · ${d.port}`;
-  $("offline-help").textContent = (!d.connected && d.error ? d.error + " Retrying every 3 s. " : "")
+  $("offline-help").textContent = isSim
+    ? (d.sim && !d.sim.powered ? "The simulated ESP32 is switched off — press On in the simulation controls."
+       : d.sim && d.sim.muted ? "The simulated ESP32 has stopped sending — press 'Resume sending' in the simulation controls."
+       : "Starting the simulated ESP32…")
+    : (!d.connected && d.error ? d.error + " Retrying every 3 s. " : "")
     + "Check the ESP32-S3 is powered and plugged in, close the Arduino Serial Monitor and live_integration.py, then press RST on the board.";
   $("model").className = "pill " + (d.model ? "ok" : "warn");
   $("model").textContent = d.model ? `AI: ${d.model}` : `No AI model — using the ${d.limit} rule`;
@@ -430,7 +481,37 @@ function renderOffline(d) {
   renderCommon(d);
 }
 
+let lastSim = null, sliderBusy = false;
+function renderSim(s) {
+  lastSim = s;
+  if (!s) return;
+  const on = (id, yes, cls = "") => $(id).className = yes ? "on " + cls : "";
+  on("pw-on", s.powered, "good"); on("pw-off", !s.powered, "bad");
+  $("rst").disabled = !s.powered;
+  $("mute").disabled = !s.powered;
+  $("mute").textContent = s.muted ? "Resume sending" : "Stop sending";
+  on("t-auto", s.temp_mode === "auto"); on("t-man", s.temp_mode === "manual");
+  if (!sliderBusy) { $("t-slider").value = s.manual_temp; $("t-val").textContent = Number(s.manual_temp).toFixed(1) + " °C"; }
+  $("t-step").textContent = s.temp_mode === "manual"
+    ? "Fan rule: below 33 °C off · 33–39 °C 35% · above 39 °C 100%"
+    : `Now: ${s.cycle_step} — cycle restarts in ${s.cycle_left} s`;
+  ["A", "B"].forEach(v => { on(`c${v}-clean`, !s.clogged[v], "good"); on(`c${v}-clog`, s.clogged[v], "bad"); });
+}
+function sim(path) { post("/api/sim/" + path); }
+function setClog(v, want) { if (lastSim && lastSim.clogged[v] !== want) sim("clog/" + v); }
+(() => {
+  const sl = $("t-slider");
+  let timer = null;
+  sl.addEventListener("input", () => {
+    sliderBusy = true;
+    $("t-val").textContent = Number(sl.value).toFixed(1) + " °C";
+    clearTimeout(timer);
+    timer = setTimeout(() => { sim("temp/" + sl.value); setTimeout(() => sliderBusy = false, 800); }, 150);
+  });
+})();
+
 function renderCommon(d) {
+  renderSim(d.sim);
   $("log").innerHTML = d.events.length ? d.events.map(e =>
     `<li><time>${new Date(e.t * 1000).toLocaleTimeString()}</time><span class="${e.level}">${e.text.replace(/</g, "&lt;")}</span></li>`).join("")
     : '<li class="muted">Nothing yet.</li>';

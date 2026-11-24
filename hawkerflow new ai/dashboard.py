@@ -7,9 +7,9 @@ temperature, fan, the pressure drop of each filter, vent open/closed, alerts.
 Run (close the Arduino Serial Monitor and live_integration.py first):
     python dashboard.py                 real ESP32 on COM7
     python dashboard.py --com COM5      real ESP32 on another port
-    python dashboard.py --demo          no board needed: a simulated ESP32
 
 Then open  http://localhost:8000  (it opens by itself).
+No board? Use  python simulation.py  instead (a separate simulated dashboard).
 """
 import argparse
 import collections
@@ -18,7 +18,6 @@ import json
 import math
 import os
 import queue
-import random
 import sys
 import threading
 import time
@@ -42,7 +41,7 @@ status = {
 }
 history = collections.deque(maxlen=HISTORY_POINTS)
 events = collections.deque(maxlen=EVENT_LIMIT)
-demo = None                         # FakeESP32 when running with --demo
+sim = None                          # set by simulation.py: the simulated ESP32
 
 
 def add_event(level, text):
@@ -128,16 +127,13 @@ def handle_command(cmd, esp32):
         with lock:
             li.open_vent(v, esp32)
         add_event("info", f"Vent {v} opened by hand (dashboard)")
-    elif kind == "clog" and demo is not None and v in li.VENTS:
-        demo.clogged[v] = not demo.clogged[v]
-        add_event("demo", f"Simulated filter {v} is now {'CLOGGED' if demo.clogged[v] else 'clean'}")
 
 
 def serial_loop(make_port):
     while True:
         try:
             with make_port() as esp32:
-                time.sleep(0 if demo else 2)
+                time.sleep(0 if sim else 2)
                 esp32.reset_input_buffer()
                 for v in li.VENTS:            # same start-up as live_integration.main()
                     esp32.write(f"VENT {v} OPEN\n".encode())
@@ -173,92 +169,9 @@ def serial_loop(make_port):
                 status["connected"], status["error"] = False, text
             if was:
                 add_event("warn", f"Lost the ESP32: {error}")
-            print("Serial:", error, "- retrying in 3 s")
-            time.sleep(3)
-
-
-# ---------------- Simulated ESP32 (--demo) ----------------
-class FakeESP32:
-    """Behaves like HawkerFlow.ino on the serial port, without any hardware.
-
-    Temperature cycles through not cooking -> cooking -> hot -> cooling every
-    3 minutes. Use the 'Simulate clog' buttons on the page to block a filter.
-    """
-    PERIOD = 2.0
-
-    def __init__(self):
-        self.start = time.time()
-        self.next_at = self.start + 1
-        self.fan = 100                  # OFFLINE start-up speed, like the firmware
-        self.mask = 0
-        self.clogged = {"A": False, "B": False}
-        self.replies = collections.deque()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def reset_input_buffer(self):
-        self.replies.clear()
-
-    def write(self, raw):
-        line = raw.decode().strip()
-        if line.startswith("SPEED "):
-            self.fan = int(line.split()[1])
-            self.replies.append(f"ACK,SPEED,{self.fan}")
-        elif line.startswith("VENT "):
-            _, v, action = line.split()
-            bit = 1 if v == "A" else 2
-            self.mask = self.mask | bit if action == "CLOSE" else self.mask & ~bit
-            self.replies.append(f"ACK,VENT,{v},{'CLOSED' if self.mask & bit else 'OPEN'}")
-        elif line.startswith("PREDICTION:"):
-            self.state = line.split(":", 1)[1]
-            self.replies.append(f"ACK,PREDICTION,{self.state},2/2")
-
-    def temperature(self, t):
-        phase = t % 180
-        if phase < 30:
-            base = 29
-        elif phase < 50:
-            base = 29 + (phase - 30) * 0.35     # warming up
-        elif phase < 90:
-            base = 36                            # cooking
-        elif phase < 150:
-            base = 42                            # wok hei
-        else:
-            base = 42 - (phase - 150) * 0.4      # cooling down
-        return base + random.uniform(-0.3, 0.3)
-
-    def drop(self, v, bit):
-        if self.fan == 0:
-            return random.uniform(-0.1, 0.1)
-        if self.mask & bit:                      # closed: almost no air through it
-            return random.uniform(-0.05, 0.1)
-        if self.clogged[v]:                      # like the blocked runs in real_pressure_data.csv
-            return 8 * self.fan / 100 + random.uniform(-0.4, 0.4)
-        return 0.15 + random.uniform(-0.1, 0.1)
-
-    def readline(self):
-        if self.replies:
-            return (self.replies.popleft() + "\n").encode()
-        wait = self.next_at - time.time()
-        if wait > 0:
-            time.sleep(min(wait, 0.25))          # stay responsive to button presses
-            return b""
-        self.next_at += self.PERIOD
-        t = time.time() - self.start
-        temp = self.temperature(t)
-        pa = -0.1 * self.fan / 35 + random.uniform(-0.05, 0.05)
-        da, db = self.drop("A", 1), self.drop("B", 2)
-        pc, pb = pa + da, pa + db
-        rpm = self.fan * 32 + random.uniform(-40, 40) if self.fan else 0
-        state = getattr(self, "state", "OFFLINE")
-        line = (f"DATA,{int(t * 1000)},{temp:.1f},{60 + random.uniform(-3, 3):.1f},"
-                f"{pa:.1f},{pb:.1f},{pc:.1f},{pb - pa:.1f},{pc - pa:.1f},"
-                f"{self.fan},{self.fan},{self.mask},{rpm:.0f},{rpm:.0f},{state}")
-        return (line + "\n").encode()
+            if not sim:
+                print("Serial:", error, "- retrying in 3 s")
+            time.sleep(1 if sim else 3)
 
 
 # ---------------- Web server ----------------
@@ -285,7 +198,7 @@ def snapshot():
             "model": li.MODEL_FILE if li.model is not None else None,
             "limit": li.PRESSURE_LIMIT,
             "settings": {"confirm": li.CONFIRM_READS, "reopen": li.REOPEN_READS, "min_closed": li.MIN_CLOSED_S},
-            "demo_clogged": dict(demo.clogged) if demo else None,
+            "sim": sim.status() if sim else None,
             "history": list(history),
             "events": list(events)[::-1],
         }
@@ -309,11 +222,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send(404, b"not found", "text/plain")
 
     def do_POST(self):
-        parts = self.path.strip("/").split("/")        # api/vent/A/open, api/demo/clog/A
+        parts = self.path.strip("/").split("/")        # api/vent/A/open, api/sim/<action>/<value>
         if len(parts) == 4 and parts[:2] == ["api", "vent"] and parts[3] == "open":
             commands.put(("open", parts[2].upper()))
-        elif len(parts) == 4 and parts[:3] == ["api", "demo", "clog"]:
-            commands.put(("clog", parts[3].upper()))
+        elif len(parts) == 4 and parts[:2] == ["api", "sim"] and sim is not None:
+            message = sim.control(parts[2], parts[3])  # works even while the fake ESP32 is "off"
+            if message:
+                add_event("sim", message)
         else:
             return self.send(404, b"not found", "text/plain")
         self.send(200, b'{"ok":true}', "application/json")
@@ -322,34 +237,34 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-def main():
-    parser = argparse.ArgumentParser(description="HawkerFlow web dashboard")
-    parser.add_argument("--com", default=li.PORT, help=f"ESP32 serial port (default {li.PORT})")
-    parser.add_argument("--demo", action="store_true", help="use a simulated ESP32")
-    parser.add_argument("--web-port", type=int, default=8000, help="dashboard port (default 8000)")
-    parser.add_argument("--no-browser", action="store_true", help="don't open the browser")
-    args = parser.parse_args()
-
-    global demo
-    if args.demo:
-        demo = FakeESP32()
-        status["mode"], status["port"] = "demo", "simulated ESP32"
-        make_port = lambda: demo                        # noqa: E731
-    else:
-        import serial
-        status["mode"], status["port"] = "live", args.com
-        make_port = lambda: serial.Serial(args.com, li.BAUD_RATE, timeout=2)  # noqa: E731
-
+def serve(mode, port_label, make_port, web_port, open_browser=True):
+    """Start the serial thread and the web page. Also used by simulation.py."""
+    status["mode"], status["port"] = mode, port_label
     threading.Thread(target=serial_loop, args=(make_port,), daemon=True).start()
-    server = ThreadingHTTPServer(("127.0.0.1", args.web_port), Handler)
-    url = f"http://localhost:{args.web_port}"
-    print(f"\nHawkerFlow dashboard: {url}   (Ctrl+C to stop)\n")
-    if not args.no_browser:
+    server = ThreadingHTTPServer(("127.0.0.1", web_port), Handler)
+    url = f"http://localhost:{web_port}"
+    print(f"\nHawkerFlow {'simulation' if mode == 'sim' else 'dashboard'}: {url}   (Ctrl+C to stop)\n")
+    if open_browser:
         webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="HawkerFlow live dashboard (real ESP32)")
+    parser.add_argument("--com", default=li.PORT, help=f"ESP32 serial port (default {li.PORT})")
+    parser.add_argument("--web-port", type=int, default=8000, help="dashboard port (default 8000)")
+    parser.add_argument("--no-browser", action="store_true", help="don't open the browser")
+    parser.add_argument("--demo", action="store_true", help=argparse.SUPPRESS)   # old flag
+    args = parser.parse_args()
+    if args.demo:
+        sys.exit("The simulation is now separate:  python simulation.py   (http://localhost:8001)")
+
+    import serial
+    serve("live", args.com, lambda: serial.Serial(args.com, li.BAUD_RATE, timeout=2),
+          args.web_port, not args.no_browser)
 
 
 if __name__ == "__main__":
