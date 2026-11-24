@@ -1,7 +1,7 @@
 // =====================================================================
 //  HawkerFlow – main ESP32-S3 firmware (Person 2)
 //
-//  Every 2 s: read DHT22 + pressure sensor, send one CSV line to the laptop.
+//  Every 2 s: read DHT22 + 3 pressure sensors, send one CSV line to the laptop.
 //  Laptop (Python AI) answers  PREDICTION:NORMAL | COOKING | BLOCKED
 //  ESP32 sets fans, LEDs and LCD for that state.
 //
@@ -12,7 +12,9 @@
 //    (6-pin L298N only: ENA -> 10, ENB -> 13, jumpers removed; set FAN_HAS_EN 1)
 //    Servo 1 (damper flap) -> 15, Servo 2 (AT-46 damper) -> 7 (both powered from 5 V)
 //    LEDs R/Y/G -> 16/38/39    LCD I2C SDA/SCL -> 8/9
-//    Pressure sensor HX710B: VCC -> 3V3, OUT -> 18, SCK -> 17 (tube into the duct)
+//    Pressure sensor 1 HX710B: VCC -> 3V3, OUT -> 18, SCK -> 17 (tube into the duct)
+//    Pressure sensor 2 HX710B: VCC -> 3V3, OUT -> 40, SCK -> 41
+//    Pressure sensor 3 HX710B: VCC -> 3V3, OUT -> 42, SCK -> 47
 //    Common GND for battery, L298, servo and ESP32.
 //
 //  Libraries: DHT sensor library, Adafruit Unified Sensor (servo needs no library),
@@ -20,9 +22,14 @@
 //
 //  ---------------- Serial protocol (115200 baud, '\n' line endings) ----
 //  ESP32 -> laptop:
-//    HEADER,millis,temp_c,humidity,pressure,fan_a_pct,fan_b_pct,damper_closed,rpm_a,rpm_b,state
-//    pressure = change in duct pressure since power-on, in thousands of sensor
-//    counts (+ = higher than room, - = lower). "ZERO" resets it.
+//    HEADER,millis,temp_c,humidity,pressure,pressure2,pressure3,pressure_diff,pressure_diff3,fan_a_pct,fan_b_pct,damper_closed,rpm_a,rpm_b,state
+//    pressure / pressure2 / pressure3 = change in duct pressure at sensor 1 (A) /
+//    sensor 2 (B) / sensor 3 (C) since power-on, in thousands of sensor counts
+//    (+ = higher than room, - = lower).
+//    pressure_diff  = pressure2 - pressure (B minus A: vent B; nan if either is missing).
+//    pressure_diff3 = pressure3 - pressure (C minus A: vent A; nan if either is missing).
+//    "ZERO" resets all three.
+//    damper_closed = which vents are closed: 0 none, 1 vent A, 2 vent B, 3 both.
 //    DATA,<values in the same order>          (every 2 s)
 //    ACK,<what was accepted>   /   ERR,<why>   (replies to commands)
 //    Lines that do not start with DATA are info - Python should ignore them.
@@ -30,17 +37,28 @@
 //    PREDICTION:NORMAL | PREDICTION:COOKING | PREDICTION:BLOCKED
 //    DAMPER CLOSE  (simulate a blocked duct; pauses automatic damper moves; small fan OFF)
 //    DAMPER OPEN   (open it, return the damper to automatic; small fan ON)
+//    OPEN | CLOSE  (AT-46 servo only, like an MG90S: OPEN = 90 deg, CLOSE = 0 deg)
+//    ANGLE <0-180> (AT-46 servo only: go to any angle, for tuning)
 //    FAN A <0-100> | FAN B <0-100> (switches to MANUAL mode)
+//    VENT A CLOSE | VENT A OPEN | VENT B CLOSE | VENT B OPEN
+//                  close / open ONE vent (its own servo). Used by the laptop to shut
+//                  the vent whose filter is clogged.
 //    MODE AUTO | MODE MANUAL       STATUS
+//    SPEED <0-100>  laptop sets both fans (e.g. from temperature) but stays in AUTO,
+//                   so LEDs / LCD / damper still follow PREDICTION. Must be re-sent
+//                   at least every AI_TIMEOUT_MS, otherwise the state table takes over.
+//    SPEED AUTO     back to the state table
 //
 //  NOTE for the AI team: fan_a_pct, fan_b_pct, damper_closed and state are
 //  OUTPUTS of the system, logged for the record. Do NOT train the model on
-//  them – use temp_c, humidity, pressure (and rpm if tach is enabled).
+//  them – use temp_c, humidity, pressure, pressure2, pressure3, pressure_diff,
+//  pressure_diff3 (and rpm if tach is enabled).
 // =====================================================================
 
 #include <Wire.h>
 #include <DHT.h>
 #include <LiquidCrystal_I2C.h>
+#include <Preferences.h>     // remembers the 360-servo position across resets
 
 // ---------------- Pins ----------------
 #define DHT_PIN   4
@@ -57,8 +75,13 @@
 #define LED_R     16
 #define LED_Y     38       // moved from 17 (17/18 now used by the pressure sensor)
 #define LED_G     39       // moved from 18
-#define HX_OUT    18       // HX710B pressure sensor OUT
-#define HX_SCK    17       // HX710B pressure sensor SCK
+#define HX_OUT    18       // HX710B pressure sensor 1 OUT
+#define HX_SCK    17       // HX710B pressure sensor 1 SCK
+#define HX2_OUT   40       // HX710B pressure sensor 2 OUT
+#define HX2_SCK   41       // HX710B pressure sensor 2 SCK
+#define HX3_OUT   42       // HX710B pressure sensor 3 OUT
+#define HX3_SCK   47       // HX710B pressure sensor 3 SCK
+// (Don't use TX/RX = GPIO 43/44: those carry Serial to the laptop on this board.)
 #define TACH_A    1
 #define TACH_B    2
 
@@ -86,7 +109,11 @@ const unsigned long KICK_MS = 300; // full power briefly when a fan starts
 //           to give the air as much room as possible; back to OPEN when clear.
 //  CLOSED = manual test only ("DAMPER CLOSE") to SIMULATE a blockage.
 // It only moves when its target changes, and is switched off afterwards.
-const bool AUTO_DAMPER = true;     // false = damper only moves on DAMPER commands
+const bool AUTO_DAMPER = false;    // false = dampers only move on DAMPER / VENT commands
+                                   // (the laptop closes the clogged vent itself)
+
+// Which servo opens/closes which vent (0 = servo 1 on GPIO 15, 1 = servo 2 on GPIO 7).
+const int VENT_SERVO[2] = { 0, 1 };   // { vent A, vent B } - swap if they are the other way round
 
 // Your servo is a 360-degree (continuous rotation) type: it can't go to an
 // angle, it can only spin one way or the other. So a "small turn" = spin for
@@ -105,7 +132,8 @@ const int  DAMPER_CLOSED_DEG = 60;
 const int  DAMPER_RELIEF_DEG = 120;
 
 // Second damper servo: Airtecnic AT-46 on GPIO 7 (black GND, red 5V, orange 7).
-// It moves together with the first one, the same way (timed small turn).
+// Works like an MG90S: goes to an angle. OPEN = 90 deg, CLOSED = 0 deg.
+// It moves together with the first one (at the same time).
 // Tune it on its own with the "SERVO2 <us>" command, e.g. SERVO2 1000.
 const bool USE_SERVO2      = true;
 const bool SERVO2_360      = false;  // AT-46 is a normal 180-degree servo (goes to an angle)
@@ -113,8 +141,11 @@ const int  SERVO2_STOP_US  = 1500;
 const int  SERVO2_SPEED_US = 400;
 const int  SERVO2_TURN_MS  = 300;
 const int  SERVO2_CLOSE_DIR = -1;    // change to 1 if it closes the wrong way
-const int  SERVO2_OPEN_DEG   = 90;   // used because SERVO2_360 = false; bigger gap = bigger turn
-const int  SERVO2_CLOSED_DEG = 60;
+const int  SERVO2_OPEN_DEG   = 90;   // OPEN  = 90 degrees
+const int  SERVO2_CLOSED_DEG = 0;    // CLOSE = 0 degrees
+// Like servo.write() on an MG90S: keep sending the pulse after a move so the
+// servo actively HOLDS its angle (false = pulse switched off after each move).
+const bool SERVO_HOLD_ANGLE  = true;
 const int  SERVO2_RELIEF_DEG = 120;
 
 struct ServoCfg {
@@ -132,6 +163,13 @@ const int   BLOCK_READS     = 3;
 // false = OFF at power-on; "DAMPER OPEN" switches it on, "DAMPER CLOSE" off.
 const bool SMALL_FAN_ALWAYS_ON = true;
 
+// Automatic restart: after this many DATA lines the ESP32 restarts itself,
+// the same as pressing the RST button (10 reads x 2 s = every 20 s). 0 = never.
+// On every restart the pressure sensors are zeroed again and the AI state
+// starts from OFFLINE. The restart waits while the damper is not OPEN, because
+// the code assumes the flap is OPEN at power-on.
+const int RESTART_EVERY_READS = 0;    // off: re-zeroing every 20 s would hide blockages
+
 // Fan PWM frequency. Small 2-wire fans ignore fast PWM (they just run full
 // speed); a slow PWM (30-100 Hz) gives real speed control but may tick a bit.
 // Try others live with the command  FANHZ <n>  (e.g. FANHZ 50).
@@ -143,7 +181,11 @@ const uint32_t FAN_PWM_MAX = (1 << FAN_PWM_BITS) - 1;
 const int NORMAL_A  = 40,  NORMAL_B  = 30;
 const int COOKING_A = 100, COOKING_B = 100;
 const int BLOCKED_A = 50,  BLOCKED_B = 100;
-const int OFFLINE_A = 50,  OFFLINE_B = 50;
+// Not cooking: below this temperature (DHT22) the fans STOP, whatever the state
+// or laptop says (AUTO mode only - FAN A / FAN B manual commands still work).
+const float FAN_OFF_BELOW_C = 33.0;
+
+const int OFFLINE_A = 100,  OFFLINE_B = 100;   // start-up speed, and when the AI is offline
 
 // ---------------- Objects / state ----------------
 DHT dht(DHT_PIN, DHT22);
@@ -166,17 +208,24 @@ bool  everGotPred = false;
 
 int  fanPct[2] = { 0, 0 };              // [0]=A, [1]=B
 unsigned long kickUntil[2] = { 0, 0 };
-bool damperClosed = false;
 bool fanAEnabled = SMALL_FAN_ALWAYS_ON; // false: small fan runs only after DAMPER OPEN
+int  hostFanPct = -1;                   // SPEED command from the laptop; -1 = use the state table
+unsigned long lastSpeedMs = 0;
 
 float lastTemp = NAN, lastHum = NAN;
-float lastPressure = NAN;     // change since zero, in 1000s of counts
-long  pressureZero = 0;
-bool  pressureOk = false;
-int   pressureFails = 0;
+// Pressure sensors: index 0 = sensor 1 / A (18/17), index 1 = sensor 2 / B (40/41),
+// index 2 = sensor 3 / C (42/47).
+const int N_PRESS = 3;
+const int HX_OUT_PIN[N_PRESS] = { HX_OUT, HX2_OUT, HX3_OUT };
+const int HX_SCK_PIN[N_PRESS] = { HX_SCK, HX2_SCK, HX3_SCK };
+float lastPressure[N_PRESS]  = { NAN, NAN, NAN };   // change since zero, in 1000s of counts
+long  pressureZero[N_PRESS]  = { 0, 0, 0 };
+bool  pressureOk[N_PRESS]    = { false, false, false };
+int   pressureFails[N_PRESS] = { 0, 0, 0 };
 float rpmA = -1, rpmB = -1;
 
 unsigned long lastSampleMs = 0;
+int readsSinceRestart = 0;
 char rxBuf[64];
 uint8_t rxLen = 0;
 
@@ -220,7 +269,8 @@ void updateFans() {   // finish kick-starts without blocking
 // ---------------- Damper ----------------
 const int POS_CLOSED = -1, POS_OPEN = 0, POS_RELIEF = 1;
 const char *POS_NAME[] = { "CLOSED", "OPEN", "RELIEF" };   // index = pos + 1
-int  damperPos  = POS_OPEN;  // assumed: flap set OPEN by hand before power-on
+int  damperPos  = POS_OPEN;  // last DAMPER command (both servos)
+int  servoPos[2] = { POS_OPEN, POS_OPEN };  // each servo; assumed OPEN at power-on
 bool damperHold = false;     // true after "DAMPER CLOSE": automatic moves paused
 
 // Each servo is driven directly by the ESP32's LEDC PWM on its OWN channel
@@ -243,47 +293,56 @@ int posToDeg(const ServoCfg &s, int pos) {
   return pos == POS_CLOSED ? s.closedDeg : pos == POS_RELIEF ? s.reliefDeg : s.openDeg;
 }
 
+// true = this servo keeps getting its pulse after a move (holds its angle)
+bool holdsAngle(const ServoCfg &s) { return !s.is360 && SERVO_HOLD_ANGLE; }
+
+// AT-46 (servo 2) on its own, like servo.write(deg) on an MG90S.
+void at46Write(int deg) {
+  servoPulse(SERVO2_PIN, degToUs(deg));
+  if (!SERVO_HOLD_ANGLE) { delay(500); servoPulse(SERVO2_PIN, 0); }
+}
+
 void servoOff(const ServoCfg &s) {
   servoPulse(s.pin, s.is360 ? s.stopUs : 0);   // "stop" pulse first
   delay(100);
   servoPulse(s.pin, 0);                        // then no signal -> stays still
 }
 
-// Both servos start together; each stops after its own time.
-void moveDamper(int target) {
-  if (target == damperPos) return;          // already there: don't move
-  int steps = target - damperPos;            // e.g. OPEN->CLOSED = -1, CLOSED->RELIEF = +2
-  unsigned long runMs[2] = { 0, 0 };
+// The 360 servo can't tell where it is, so its position is saved in flash
+// (only when it moves). After a reset it is turned back to OPEN from there.
+Preferences prefs;
+const char *POS_KEY[2] = { "pos0", "pos1" };
+void savePos(int i) { prefs.putChar(POS_KEY[i], (char)servoPos[i]); }
 
-  for (int i = 0; i < 2; i++) {
-    const ServoCfg &s = SERVOS[i];
-    if (!s.on) continue;
-    if (s.is360) {
-      int dir = (steps < 0) ? s.closeDir : -s.closeDir;
-      servoPulse(s.pin, s.stopUs + dir * s.speedUs);    // spin...
-      runMs[i] = abs(steps) * s.turnMs;                 // ...a bit
-    } else {
-      servoPulse(s.pin, degToUs(posToDeg(s, target)));  // go to the angle
-      runMs[i] = 500;
-    }
+// Move ONE servo to OPEN / CLOSED / RELIEF.
+void moveServo(int i, int target) {
+  const ServoCfg &s = SERVOS[i];
+  if (!s.on || target == servoPos[i]) return;   // off, or already there
+  int steps = target - servoPos[i];              // e.g. OPEN->CLOSED = -1
+  if (s.is360) {                                 // 360 servo: timed small turn
+    int dir = (steps < 0) ? s.closeDir : -s.closeDir;
+    servoPulse(s.pin, s.stopUs + dir * s.speedUs);
+    delay(abs(steps) * s.turnMs);
+    servoPulse(s.pin, s.stopUs);
+    delay(100);
+    servoPulse(s.pin, 0);
+  } else {                                       // 180 servo: go to the angle
+    servoPulse(s.pin, degToUs(posToDeg(s, target)));
+    delay(500);
+    if (!holdsAngle(s)) servoPulse(s.pin, 0);
   }
-  unsigned long t0 = millis();
-  bool done[2] = { !SERVOS[0].on, !SERVOS[1].on };
-  while (!done[0] || !done[1]) {
-    for (int i = 0; i < 2; i++) {
-      if (!done[i] && millis() - t0 >= runMs[i]) {
-        servoPulse(SERVOS[i].pin, SERVOS[i].is360 ? SERVOS[i].stopUs : 0);  // stop this one
-        done[i] = true;
-      }
-    }
-    delay(1);
-  }
-  delay(100);
-  for (int i = 0; i < 2; i++) if (SERVOS[i].on) servoPulse(SERVOS[i].pin, 0);
-
-  damperPos = target;
-  damperClosed = (target == POS_CLOSED);
+  servoPos[i] = target;
+  if (s.is360) savePos(i);                       // so a reset knows where it is
 }
+
+// Both servos (DAMPER commands / AUTO_DAMPER).
+void moveDamper(int target) {
+  for (int i = 0; i < 2; i++) moveServo(i, target);
+  damperPos = target;
+}
+
+bool ventClosed(int v) { return servoPos[VENT_SERVO[v]] == POS_CLOSED; }
+int  ventMask() { return (ventClosed(0) ? 1 : 0) | (ventClosed(1) ? 2 : 0); }
 
 // Manual DAMPER commands. CLOSE holds the flap closed (test blockage) and pauses
 // the automatic moves; OPEN opens it and hands control back to automatic.
@@ -296,57 +355,70 @@ void setDamper(bool closed) {
 // HX710B pressure sensor (24-bit, ~10 readings per second).
 const long HX_FAIL = -2147483647L;
 
-long readHX710B() {
+long readHX710B(int s) {                         // s = sensor index (0, 1 or 2)
+  const int outPin = HX_OUT_PIN[s], sckPin = HX_SCK_PIN[s];
   unsigned long t0 = millis();
-  while (digitalRead(HX_OUT) == HIGH) {          // LOW = new reading ready
+  while (digitalRead(outPin) == HIGH) {          // LOW = new reading ready
     if (millis() - t0 > 150) return HX_FAIL;
     delay(1);
   }
   long v = 0;
   noInterrupts();                                // SCK must not stay HIGH > 60 us
   for (int i = 0; i < 24; i++) {
-    digitalWrite(HX_SCK, HIGH); delayMicroseconds(1);
-    v = (v << 1) | digitalRead(HX_OUT);
-    digitalWrite(HX_SCK, LOW);  delayMicroseconds(1);
+    digitalWrite(sckPin, HIGH); delayMicroseconds(1);
+    v = (v << 1) | digitalRead(outPin);
+    digitalWrite(sckPin, LOW);  delayMicroseconds(1);
   }
-  digitalWrite(HX_SCK, HIGH); delayMicroseconds(1);   // 25th pulse: pressure input, 10 Hz
-  digitalWrite(HX_SCK, LOW);  delayMicroseconds(1);
+  digitalWrite(sckPin, HIGH); delayMicroseconds(1);   // 25th pulse: pressure input, 10 Hz
+  digitalWrite(sckPin, LOW);  delayMicroseconds(1);
   interrupts();
   if (v & 0x800000) v |= 0xFF000000;
   return (v == 0 || v == -1) ? HX_FAIL : v;      // all 0s / all 1s = not connected
 }
 
-long readPressureAvg(int n) {
+long readPressureAvg(int s, int n) {
   long long sum = 0; int ok = 0;
-  for (int i = 0; i < n; i++) { long r = readHX710B(); if (r != HX_FAIL) { sum += r; ok++; } }
+  for (int i = 0; i < n; i++) { long r = readHX710B(s); if (r != HX_FAIL) { sum += r; ok++; } }
   return ok ? (long)(sum / ok) : HX_FAIL;
 }
 
-void zeroPressure() {                            // current pressure becomes "0"
-  long z = readPressureAvg(10);
-  pressureOk = (z != HX_FAIL);
-  if (pressureOk) pressureZero = z;
+void zeroPressure(int s) {                       // current pressure becomes "0"
+  long z = readPressureAvg(s, 10);
+  pressureOk[s] = (z != HX_FAIL);
+  if (pressureOk[s]) pressureZero[s] = z;
+}
+
+void zeroAllPressure() {
+  for (int s = 0; s < N_PRESS; s++) zeroPressure(s);
+}
+
+void readPressure(int s) {
+  if (!pressureOk[s]) {                 // sensor missing at start / contact lost: retry
+    zeroPressure(s);
+    if (pressureOk[s]) Serial.printf("INFO,pressure sensor %d connected - zeroed\n", s + 1);
+  }
+  long p = readPressureAvg(s, 3);
+  lastPressure[s] = (pressureOk[s] && p != HX_FAIL) ? (p - pressureZero[s]) / 1000.0 : NAN;
+  if (pressureOk[s] && p == HX_FAIL && ++pressureFails[s] >= 3) {   // lost for 3 readings in a row
+    pressureOk[s] = false;
+    pressureFails[s] = 0;
+    Serial.printf("INFO,pressure sensor %d lost - check OUT %d / SCK %d / 3V3 / GND contact\n",
+                  s + 1, HX_OUT_PIN[s], HX_SCK_PIN[s]);
+  } else if (p != HX_FAIL) {
+    pressureFails[s] = 0;
+  }
 }
 
 void readSensors(unsigned long dtMs) {
   lastTemp = dht.readTemperature();   // NAN on failure -> sent as "nan"
   lastHum  = dht.readHumidity();
-  if (!pressureOk) {                    // sensor missing at start / contact lost: retry
-    zeroPressure();
-    if (pressureOk) Serial.println("INFO,pressure sensor connected - zeroed");
-  }
-  long p = readPressureAvg(3);
-  lastPressure = (pressureOk && p != HX_FAIL) ? (p - pressureZero) / 1000.0 : NAN;
-  if (pressureOk && p == HX_FAIL && ++pressureFails >= 3) {   // lost for 3 readings in a row
-    pressureOk = false;
-    pressureFails = 0;
-    Serial.println("INFO,pressure sensor lost - check OUT 18 / SCK 17 / 3V3 / GND contact");
-  } else if (p != HX_FAIL) {
-    pressureFails = 0;
-  }
+  for (int s = 0; s < N_PRESS; s++) readPressure(s);
 
-  // Pressure safety override (off while PRESSURE_BLOCK = 0).
-  if (PRESSURE_BLOCK > 0 && !isnan(lastPressure) && fabs(lastPressure) > PRESSURE_BLOCK) blockReads++;
+  // Pressure safety override (off while PRESSURE_BLOCK = 0): either sensor over the limit counts.
+  bool over = false;
+  for (int s = 0; s < N_PRESS; s++)
+    if (!isnan(lastPressure[s]) && fabs(lastPressure[s]) > PRESSURE_BLOCK) over = true;
+  if (PRESSURE_BLOCK > 0 && over) blockReads++;
   else blockReads = 0;
   localBlocked = blockReads >= BLOCK_READS;
 
@@ -365,23 +437,40 @@ void sendData() {
   Serial.printf("DATA,%lu,", millis());
   Serial.print(lastTemp, 1);  Serial.print(',');
   Serial.print(lastHum, 1);   Serial.print(',');
-  Serial.print(lastPressure, 1); Serial.print(',');
-  Serial.printf("%d,%d,%d,", fanPct[0], fanPct[1], damperClosed ? 1 : 0);
+  Serial.print(lastPressure[0], 1); Serial.print(',');
+  Serial.print(lastPressure[1], 1); Serial.print(',');
+  Serial.print(lastPressure[2], 1); Serial.print(',');
+  Serial.print(lastPressure[1] - lastPressure[0], 1); Serial.print(',');   // B - A: vent B (nan if either is nan)
+  Serial.print(lastPressure[2] - lastPressure[0], 1); Serial.print(',');   // C - A: vent A (nan if either is nan)
+  Serial.printf("%d,%d,%d,", fanPct[0], fanPct[1], ventMask());
   Serial.print(rpmA, 0);      Serial.print(',');
   Serial.print(rpmB, 0);      Serial.print(',');
   Serial.println(manualMode ? "MANUAL" : STATE_NAME[shownState]);
 }
 
 // ---------------- State -> outputs ----------------
+bool hostFanActive() {
+  return hostFanPct >= 0 && millis() - lastSpeedMs <= AI_TIMEOUT_MS;
+}
+
+bool tooColdForFans() {    // not cooking -> fans off (no reading = keep running)
+  return !isnan(lastTemp) && lastTemp < FAN_OFF_BELOW_C;
+}
+
 void applyFans() {
   if (manualMode) return;   // fans stay where FAN commands put them
   int a = OFFLINE_A, b = OFFLINE_B;
-  switch (shownState) {
-    case NORMAL:  a = NORMAL_A;  b = NORMAL_B;  break;
-    case COOKING: a = COOKING_A; b = COOKING_B; break;
-    case BLOCKED: a = BLOCKED_A; b = BLOCKED_B; break;
-    case OFFLINE: a = OFFLINE_A; b = OFFLINE_B; break;
+  if (hostFanActive()) {    // laptop decides the speed (SPEED command)
+    a = b = hostFanPct;
+  } else {
+    switch (shownState) {
+      case NORMAL:  a = NORMAL_A;  b = NORMAL_B;  break;
+      case COOKING: a = COOKING_A; b = COOKING_B; break;
+      case BLOCKED: a = BLOCKED_A; b = BLOCKED_B; break;
+      case OFFLINE: a = OFFLINE_A; b = OFFLINE_B; break;
+    }
   }
+  if (tooColdForFans()) a = b = 0;   // below FAN_OFF_BELOW_C: fans stop
   setFan(0, fanAEnabled ? a : 0);
   setFan(1, b);
 }
@@ -418,10 +507,14 @@ void updateLcd() {
   if (!lcdOk) return;
   char l1[17], l2[17];
   if (manualMode)                  snprintf(l1, sizeof l1, "MANUAL A%3d B%3d", fanPct[0], fanPct[1]);
-  else if (shownState == BLOCKED)  snprintf(l1, sizeof l1, "BLOCKED!chk duct");
+  else if (shownState == BLOCKED) {
+    const char *which[] = { "BLOCKED!chk duct", "CHANGE FILTER A", "CHANGE FILTER B", "CHANGE FILTERS!" };
+    snprintf(l1, sizeof l1, "%s", which[ventMask()]);   // names the closed (clogged) vent
+  }
   else if (shownState == OFFLINE)  snprintf(l1, sizeof l1, "AI offline");
   else                             snprintf(l1, sizeof l1, "%s", STATE_NAME[shownState]);
-  snprintf(l2, sizeof l2, "T%.1f H%.0f P%.0f", lastTemp, lastHum, lastPressure);
+  snprintf(l2, sizeof l2, "T%.0f H%.0f %.0f/%.0f/%.0f", lastTemp, lastHum,
+           lastPressure[0], lastPressure[1], lastPressure[2]);
   lcd.setCursor(0, 0); lcd.printf("%-16s", l1);
   lcd.setCursor(0, 1); lcd.printf("%-16s", l2);
 }
@@ -455,12 +548,31 @@ void handleLine(String line) {
     setDamper(closing);
     if (!SMALL_FAN_ALWAYS_ON) fanAEnabled = !closing;   // OPEN starts the small fan, CLOSE stops it
     applyFans();              // right away, don't wait for the next 2 s cycle
-    Serial.printf("ACK,DAMPER,%s,fanA=%d\n", damperClosed ? "CLOSED" : "OPEN", fanPct[0]);
+    Serial.printf("ACK,DAMPER,%s,fanA=%d\n", closing ? "CLOSED" : "OPEN", fanPct[0]);
+  } else if (line == "VENT A CLOSE" || line == "VENT A OPEN" ||
+             line == "VENT B CLOSE" || line == "VENT B OPEN") {
+    int v = line.charAt(5) == 'A' ? 0 : 1;
+    bool closing = line.endsWith("CLOSE");
+    moveServo(VENT_SERVO[v], closing ? POS_CLOSED : POS_OPEN);
+    Serial.printf("ACK,VENT,%c,%s\n", 'A' + v, ventClosed(v) ? "CLOSED" : "OPEN");
   } else if (line.startsWith("FAN A ") || line.startsWith("FAN B ")) {
     manualMode = true;
     int ch = line.charAt(4) == 'A' ? 0 : 1;
     setFan(ch, line.substring(6).toInt());
     Serial.printf("ACK,FAN,%c,%d,MANUAL\n", 'A' + ch, fanPct[ch]);
+  } else if (line.startsWith("SPEED ")) {
+    String v = line.substring(6); v.trim();
+    if (v == "AUTO") {
+      hostFanPct = -1;
+      applyFans();
+      Serial.println("ACK,SPEED,AUTO");
+    } else {
+      hostFanPct = constrain(v.toInt(), 0, 100);
+      lastSpeedMs = millis();
+      manualMode = false;
+      applyFans();
+      Serial.printf("ACK,SPEED,%d\n", fanPct[1]);
+    }
   } else if (line == "MODE AUTO" || line == "MODE MANUAL") {
     manualMode = (line == "MODE MANUAL");
     Serial.printf("ACK,MODE,%s\n", manualMode ? "MANUAL" : "AUTO");
@@ -469,6 +581,17 @@ void handleLine(String line) {
     bool ok = ledcChangeFrequency(enPin(0), hz, FAN_PWM_BITS) && ledcChangeFrequency(enPin(1), hz, FAN_PWM_BITS);
     for (int ch = 0; ch < 2; ch++) ledcWrite(enPin(ch), map(fanPct[ch], 0, 100, 0, FAN_PWM_MAX));
     Serial.printf(ok ? "ACK,FANHZ,%lu\n" : "ERR,FANHZ %lu failed\n", (unsigned long)hz);
+  } else if (line == "OPEN" || line == "CLOSE") {
+    // AT-46 only, like an MG90S: OPEN = SERVO2_OPEN_DEG (90), CLOSE = SERVO2_CLOSED_DEG (0).
+    // Does not change the damper state / fans - use DAMPER OPEN / DAMPER CLOSE for that.
+    int deg = (line == "OPEN") ? SERVO2_OPEN_DEG : SERVO2_CLOSED_DEG;
+    at46Write(deg);
+    Serial.printf("ACK,AT46,%s,%d deg,%d us\n", line.c_str(), deg, degToUs(deg));
+  } else if (line.startsWith("ANGLE ")) {
+    // AT-46 only: go to any angle 0..180 (to find good OPEN / CLOSE values)
+    int deg = constrain(line.substring(6).toInt(), 0, 180);
+    at46Write(deg);
+    Serial.printf("ACK,AT46,ANGLE,%d deg,%d us\n", deg, degToUs(deg));
   } else if (line.startsWith("SERVO ") || line.startsWith("SERVO2 ")) {
     // debug: SERVO 1000 (servo 1) / SERVO2 1000 (servo 2) = hold that pulse 2 s
     int i = line.startsWith("SERVO2 ") ? 1 : 0;
@@ -478,12 +601,16 @@ void handleLine(String line) {
     delay(2000);
     servoOff(SERVOS[i]);
   } else if (line == "ZERO") {                      // reset pressure "0" to the current value
-    zeroPressure();
-    Serial.println(pressureOk ? "ACK,ZERO" : "ERR,pressure sensor not found");
+    zeroAllPressure();
+    if (pressureOk[0] && pressureOk[1] && pressureOk[2]) Serial.println("ACK,ZERO");
+    else Serial.printf("ERR,ZERO,sensor1=%s,sensor2=%s,sensor3=%s\n",
+                       pressureOk[0] ? "ok" : "not found", pressureOk[1] ? "ok" : "not found",
+                       pressureOk[2] ? "ok" : "not found");
   } else if (line == "STATUS") {
-    Serial.printf("ACK,STATUS,mode=%s,state=%s,ai=%s,localBlocked=%d,fanA=%d,fanB=%d,damper=%s,damperHold=%d\n",
+    Serial.printf("ACK,STATUS,mode=%s,state=%s,ai=%s,localBlocked=%d,fanA=%d,fanB=%d,laptopSpeed=%d,ventA=%s,ventB=%s,damperHold=%d\n",
                   manualMode ? "MANUAL" : "AUTO", STATE_NAME[shownState], STATE_NAME[aiState],
-                  localBlocked, fanPct[0], fanPct[1], POS_NAME[damperPos + 1], damperHold);
+                  localBlocked, fanPct[0], fanPct[1], hostFanActive() ? hostFanPct : -1,
+                  POS_NAME[servoPos[VENT_SERVO[0]] + 1], POS_NAME[servoPos[VENT_SERVO[1]] + 1], damperHold);
   } else {
     Serial.println("ERR,unknown command");
   }
@@ -519,7 +646,7 @@ void setup() {
   ledcAttachChannel(enPin(1), FAN_PWM_HZ, FAN_PWM_BITS, 1);
   ledcWrite(enPin(0), 0);
   ledcWrite(enPin(1), 0);
-  // Servos on channels 4 + 5 (same 50 Hz timer). NOT moved at start-up.
+  // Servos on channels 4 + 5 (same 50 Hz timer).
   if (!ledcAttachChannel(SERVO_PIN, 50, 14, 4)) Serial.println("INFO,servo 1 PWM setup failed");
   servoPulse(SERVO_PIN, 0);
   if (USE_SERVO2) {
@@ -527,15 +654,49 @@ void setup() {
     servoPulse(SERVO2_PIN, 0);
   }
 
+  // After every reset: OPEN both vents first.
+  //  - 360 servo: turn back from wherever it was before the reset (saved in flash).
+  //  - angle servo (AT-46): just go to the OPEN angle.
+  prefs.begin("hawkerflow", false);
+  for (int i = 0; i < 2; i++) {
+    const ServoCfg &s = SERVOS[i];
+    if (!s.on) continue;
+    if (s.is360) {
+      servoPos[i] = prefs.getChar(POS_KEY[i], POS_OPEN);
+      if (servoPos[i] != POS_OPEN)
+        Serial.printf("INFO,servo %d was %s before the reset - opening it\n", i + 1, POS_NAME[servoPos[i] + 1]);
+      moveServo(i, POS_OPEN);
+    } else {
+      servoPulse(s.pin, degToUs(s.openDeg));
+      delay(500);
+      if (!holdsAngle(s)) servoPulse(s.pin, 0);
+      servoPos[i] = POS_OPEN;
+    }
+  }
+  Serial.println("INFO,vents A and B open");
+
   dht.begin();
 
-  // Pressure sensor: zero it now, while the fans are still off.
-  pinMode(HX_SCK, OUTPUT);
-  digitalWrite(HX_SCK, LOW);
-  pinMode(HX_OUT, INPUT_PULLUP);
+  // Pressure sensors: zero them now, while the fans are still off.
+  for (int s = 0; s < N_PRESS; s++) {
+    pinMode(HX_SCK_PIN[s], OUTPUT);
+    digitalWrite(HX_SCK_PIN[s], LOW);
+    pinMode(HX_OUT_PIN[s], INPUT_PULLUP);
+  }
   delay(200);
-  zeroPressure();
-  if (!pressureOk) Serial.println("INFO,pressure sensor not found (OUT 18 / SCK 17) - sending nan");
+  zeroAllPressure();
+  for (int s = 0; s < N_PRESS; s++)
+    if (!pressureOk[s])
+      Serial.printf("INFO,pressure sensor %d not found (OUT %d / SCK %d) - sending nan\n",
+                    s + 1, HX_OUT_PIN[s], HX_SCK_PIN[s]);
+
+  // First temperature reading, so the fans don't start if it is below FAN_OFF_BELOW_C.
+  lastTemp = dht.readTemperature();
+  lastHum  = dht.readHumidity();
+
+  // Start the fans right away at the start-up speed (OFFLINE_A / OFFLINE_B), or keep them off below FAN_OFF_BELOW_C,
+  // after the pressure zeroing above so the zero is taken in still air.
+  applyFans();
 
   Wire.begin(SDA_PIN, SCL_PIN);
   Wire.beginTransmission(LCD_ADDR);
@@ -550,7 +711,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(TACH_B), tachIsrB, FALLING);
 #endif
 
-  Serial.println("HEADER,millis,temp_c,humidity,pressure,fan_a_pct,fan_b_pct,damper_closed,rpm_a,rpm_b,state");
+  Serial.println("HEADER,millis,temp_c,humidity,pressure,pressure2,pressure3,pressure_diff,pressure_diff3,fan_a_pct,fan_b_pct,damper_closed,rpm_a,rpm_b,state");
   lastSampleMs = millis();
 }
 
@@ -567,5 +728,16 @@ void loop() {
     applyState();
     sendData();
     updateLcd();
+
+    if (RESTART_EVERY_READS > 0 && ++readsSinceRestart >= RESTART_EVERY_READS) {
+      if (servoPos[0] == POS_OPEN && servoPos[1] == POS_OPEN) {
+        Serial.printf("INFO,restarting after %d reads\n", readsSinceRestart);
+        Serial.flush();               // let the message finish sending
+        delay(50);
+        ESP.restart();                // software reset, like pressing RST
+      } else if (readsSinceRestart == RESTART_EVERY_READS) {
+        Serial.println("INFO,restart postponed - waiting for the damper to be OPEN");
+      }
+    }
   }
 }

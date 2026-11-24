@@ -58,13 +58,13 @@ def process_sensor_data(message):
         # validated only for 35% fan speed.
         if new_fan == 35 and current_fan == 35:
 
-            if active_delta >= 0:
-                blocked = active_delta > PRESSURE_LIMIT
+            # size of the difference, either sign
+            blocked = abs(active_delta) > PRESSURE_LIMIT
 
-                if blocked:
-                    proposed_route = (
-                        "B" if route == "A" else "A"
-                    )
+            if blocked:
+                proposed_route = (
+                    "B" if route == "A" else "A"
+                )
 
         print("\n----------------------------")
         print("Temperature:", temp, "C")
