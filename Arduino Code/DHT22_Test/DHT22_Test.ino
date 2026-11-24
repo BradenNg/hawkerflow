@@ -1,6 +1,7 @@
 // DHT22 test for ESP32-S3
 // Wiring: DHT22 VCC -> 3V3, GND -> GND, DATA -> GPIO 4 (10k pull-up DATA->3V3 if bare 4-pin sensor)
-// Libraries: "DHT sensor library" + "Adafruit Unified Sensor" (both by Adafruit)
+// Libraries: "DHT sensor library" + "Adafruit U
+//nified Sensor" (both by Adafruit)
 
 #include <DHT.h>
 
