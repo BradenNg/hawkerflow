@@ -45,7 +45,8 @@ def main():
     f = open(args.out, "a", newline="")
     w = csv.writer(f)
     if new_file:
-        w.writerow(["pc_time", "label", "millis", "temp_c", "humidity", "pressure",
+        w.writerow(["pc_time", "label", "millis", "temp_c", "humidity", "pressure", "pressure2", "pressure3",
+                    "pressure_diff", "pressure_diff3",
                     "fan_a_pct", "fan_b_pct", "damper_closed", "rpm_a", "rpm_b", "state"])
 
     keys = queue.Queue()
